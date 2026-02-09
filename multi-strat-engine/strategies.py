@@ -1,0 +1,650 @@
+"""
+Multi-strategy crypto futures engine — Python port
+Provided by user (file_238). Kept as-is.
+"""
+
+from __future__ import annotations
+import time
+import math
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, Literal
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Candle:
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    timestamp: float = 0.0
+
+@dataclass
+class Signal:
+    side: Literal["LONG", "SHORT"]
+    confidence: float
+    tp_percent: float
+    sl_percent: float
+    leverage: int
+    reason: str
+
+@dataclass
+class TradeEconomics:
+    total_fees: float
+    net_tp: float
+    net_sl: float
+    tp_roi: float
+    sl_roi: float
+    risk_reward: float
+    breakeven_move: float
+    is_profitable: bool
+
+@dataclass
+class TradeSignal:
+    pair: str
+    strategy_id: str
+    strategy_name: str
+    strategy_category: str
+    side: Literal["LONG", "SHORT"]
+    confidence: float
+    entry_price: float
+    tp_price: float
+    sl_price: float
+    leverage: int
+    trade_size: float
+    reason: str
+    economics: TradeEconomics
+    timestamp: float = field(default_factory=time.time)
+    _filtered: bool = field(default=False, repr=False)
+    _filter_reason: str = field(default="", repr=False)
+
+@dataclass
+class ActiveTrade:
+    pair: str
+    strategy_id: str = ""
+    side: Literal["LONG", "SHORT"] = "LONG"
+
+@dataclass
+class BTCMacroStatus:
+    is_macro_move: bool
+    direction: Optional[Literal["LONG", "SHORT"]]
+    magnitude: float
+    btc_price: float = 0.0
+
+@dataclass
+class DrawdownStatus:
+    paused: bool
+    drawdown: float
+    peak: float = 0.0
+    threshold: float = 0.0
+    message: Optional[str] = None
+
+@dataclass
+class ScanDiagnostics:
+    raw_count: int = 0
+    after_cooldown: int = 0
+    after_flood: int = 0
+    after_category: int = 0
+    final: int = 0
+    reason: str = ""
+
+@dataclass
+class ScanResult:
+    signals: list[TradeSignal] = field(default_factory=list)
+    filtered: list[TradeSignal] = field(default_factory=list)
+    btc_macro: Optional[BTCMacroStatus] = None
+    drawdown: Optional[DrawdownStatus] = None
+    diagnostics: ScanDiagnostics = field(default_factory=ScanDiagnostics)
+
+CONFIG = {
+    "min_trade_size": 10,
+    "max_concurrent_trades": 3,
+    "risk_per_trade": 0.02,
+    "confidence_threshold": 0.62,
+    "confirm_signal": True,
+    "min_volatility_pct": 0.002,  # 0.2%
+    "trend_ema_fast": 50,
+    "trend_ema_slow": 200,
+    "regime_min_trend_pct": 0.0015,
+    "atr_period": 14,
+    "vol_target_pct": 0.004,
+    "max_funding_long": 0.0005,
+    "max_funding_short": 0.0005,
+    "fees": {"maker_rate": 0.0002, "taker_rate": 0.0005},
+    "correlation": {
+        "max_same_side_signals": 2,
+        "max_per_category": 1,
+        "same_side_window_sec": 120,
+        "btc_move_lookback": 5,
+        "btc_move_threshold": 0.008,
+        "cooldown_sec": 300,
+        "post_close_cooldown_sec": 600,
+        "max_drawdown_pause": 0.05,
+    },
+    "strategy_categories": {
+        "trend": ["ema_scalp", "triple_ema", "macd_flip", "atr_breakout"],
+        "reversion": ["rsi_snap", "stoch_cross", "obv_divergence"],
+        "structural": ["bb_squeeze", "vwap_bounce", "engulfing_sr"],
+    },
+    "pairs": [
+        "ETHUSDT", "BNBUSDT", "SOLUSDT", "LINKUSDT", "LTCUSDT", "DOGEUSDT",
+    ],
+    "timeframes": ["1m", "5m"],
+}
+
+def calculate_trade_economics(entry_price: float, tp_price: float, sl_price: float, side: str, trade_size: float, leverage: int) -> TradeEconomics:
+    notional = trade_size * leverage
+    qty = notional / entry_price
+    taker = CONFIG["fees"]["taker_rate"]
+    entry_fee = notional * taker
+    exit_fee = notional * taker
+    total_fees = entry_fee + exit_fee
+    if side == "LONG":
+        tp_pnl = (tp_price - entry_price) * qty
+        sl_pnl = (sl_price - entry_price) * qty
+    else:
+        tp_pnl = (entry_price - tp_price) * qty
+        sl_pnl = (entry_price - sl_price) * qty
+    net_tp = tp_pnl - total_fees
+    net_sl = sl_pnl - total_fees
+    tp_roi = (net_tp / trade_size) * 100
+    sl_roi = (net_sl / trade_size) * 100
+    risk_reward = abs(net_tp) / abs(net_sl) if abs(net_sl) > 0 else 0
+    breakeven_move = (total_fees / notional) * 100
+    return TradeEconomics(total_fees=total_fees, net_tp=net_tp, net_sl=net_sl, tp_roi=tp_roi, sl_roi=sl_roi, risk_reward=risk_reward, breakeven_move=breakeven_move, is_profitable=net_tp > 0 and risk_reward > 1.0)
+
+def sma(data: list[float], period: int) -> Optional[float]:
+    if len(data) < period:
+        return None
+    return sum(data[-period:]) / period
+
+def ema(data: list[float], period: int) -> Optional[float]:
+    if len(data) < period:
+        return None
+    k = 2 / (period + 1)
+    val = sma(data[:period], period)
+    for i in range(period, len(data)):
+        val = data[i] * k + val * (1 - k)
+    return val
+
+def rsi(closes: list[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    gains = 0.0
+    losses = 0.0
+    for i in range(len(closes) - period, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains += diff
+        else:
+            losses -= diff
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def macd(closes: list[float]) -> dict:
+    fast = ema(closes, 12)
+    slow = ema(closes, 26)
+    if fast is None or slow is None:
+        return {"line": 0.0, "signal": 0.0, "histogram": 0.0}
+    macd_history = []
+    for i in range(30, len(closes) + 1):
+        f = ema(closes[:i], 12)
+        s = ema(closes[:i], 26)
+        if f is not None and s is not None:
+            macd_history.append(f - s)
+    macd_line = fast - slow
+    signal_line = ema(macd_history, 9) if len(macd_history) >= 9 else 0.0
+    if signal_line is None:
+        signal_line = 0.0
+    return {"line": macd_line, "signal": signal_line, "histogram": macd_line - signal_line}
+
+def bollinger_bands(closes: list[float], period: int = 20, mult: float = 2.0) -> Optional[dict]:
+    if len(closes) < period:
+        return None
+    slc = closes[-period:]
+    mean = sum(slc) / period
+    variance = sum((v - mean) ** 2 for v in slc) / period
+    std = math.sqrt(variance)
+    upper = mean + mult * std
+    lower = mean - mult * std
+    bandwidth = (upper - lower) / mean if mean != 0 else 0
+    return {"upper": upper, "middle": mean, "lower": lower, "std": std, "bandwidth": bandwidth}
+
+def atr(candles: list[Candle], period: int = 14) -> float:
+    if len(candles) < period + 1:
+        return 0.0
+    total = 0.0
+    for i in range(len(candles) - period, len(candles)):
+        tr = max(candles[i].high - candles[i].low, abs(candles[i].high - candles[i - 1].close), abs(candles[i].low - candles[i - 1].close))
+        total += tr
+    return total / period
+
+def stochastic(candles: list[Candle], k_period: int = 14) -> dict:
+    if len(candles) < k_period:
+        return {"k": 50.0, "d": 50.0}
+    slc = candles[-k_period:]
+    high = max(c.high for c in slc)
+    low = min(c.low for c in slc)
+    if high == low:
+        return {"k": 50.0, "d": 50.0}
+    k_val = ((candles[-1].close - low) / (high - low)) * 100
+    k_values = []
+    for i in range(max(0, len(candles) - 3), len(candles)):
+        s = candles[max(0, i - k_period + 1): i + 1]
+        h = max(c.high for c in s)
+        l = min(c.low for c in s)
+        k_values.append(50.0 if h == l else ((candles[i].close - l) / (h - l)) * 100)
+    d_val = sum(k_values) / len(k_values) if k_values else 50.0
+    return {"k": k_val, "d": d_val}
+
+def vwap(candles: list[Candle], period: int = 20) -> Optional[float]:
+    slc = candles[-period:]
+    cum_tp_v = 0.0
+    cum_v = 0.0
+    for c in slc:
+        tp = (c.high + c.low + c.close) / 3
+        cum_tp_v += tp * c.volume
+        cum_v += c.volume
+    return cum_tp_v / cum_v if cum_v > 0 else None
+
+def obv(candles: list[Candle]) -> float:
+    val = 0.0
+    for i in range(1, len(candles)):
+        if candles[i].close > candles[i - 1].close:
+            val += candles[i].volume
+        elif candles[i].close < candles[i - 1].close:
+            val -= candles[i].volume
+    return val
+
+def volume_spike(candles: list[Candle], lookback: int = 20) -> float:
+    if len(candles) < lookback + 1:
+        return 1.0
+    vols = [c.volume for c in candles[-(lookback + 1):-1]]
+    avg_vol = sma(vols, lookback)
+    if avg_vol is None or avg_vol == 0:
+        return 1.0
+    return candles[-1].volume / avg_vol
+
+class BaseStrategy:
+    id: str = ""
+    name: str = ""
+    timeframe: str = "1m"
+    leverage: int = 10
+    avg_signals_per_hour: float = 0.0
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        raise NotImplementedError
+
+class EMAScalpStrategy(BaseStrategy):
+    id = "ema_scalp"
+    name = "EMA 3/8 Scalp Crossover"
+    timeframe = "1m"
+    leverage = 15
+    avg_signals_per_hour = 1.5
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 30: return None
+        closes = [c.close for c in candles]
+        ema3_now = ema(closes, 3); ema8_now = ema(closes, 8)
+        ema3_prev = ema(closes[:-1], 3); ema8_prev = ema(closes[:-1], 8)
+        if any(v is None for v in [ema3_now, ema8_now, ema3_prev, ema8_prev]): return None
+        rsi_val = rsi(closes, 7); vol_ratio = volume_spike(candles, 15)
+        if ema3_prev <= ema8_prev and ema3_now > ema8_now and rsi_val < 68 and vol_ratio > 0.8:
+            conf = 0.60 + min((68 - rsi_val) / 150, 0.15) + (0.05 if vol_ratio > 1.3 else 0)
+            return Signal(side="LONG", confidence=conf, tp_percent=0.004, sl_percent=0.003, leverage=15, reason=f"EMA3 crossed above EMA8 | RSI(7)={rsi_val:.1f} | Vol={vol_ratio:.1f}x")
+        if ema3_prev >= ema8_prev and ema3_now < ema8_now and rsi_val > 32 and vol_ratio > 0.8:
+            conf = 0.60 + min((rsi_val - 32) / 150, 0.15) + (0.05 if vol_ratio > 1.3 else 0)
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.004, sl_percent=0.003, leverage=15, reason=f"EMA3 crossed below EMA8 | RSI(7)={rsi_val:.1f} | Vol={vol_ratio:.1f}x")
+        return None
+
+class RSISnapStrategy(BaseStrategy):
+    id = "rsi_snap"; name = "RSI Snap Reversal"; timeframe = "1m"; leverage = 12; avg_signals_per_hour = 1.2
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 30: return None
+        closes = [c.close for c in candles]
+        rsi7 = rsi(closes, 7); rsi14 = rsi(closes, 14); vol_ratio = volume_spike(candles, 20)
+        if rsi7 < 20 and rsi14 < 35 and vol_ratio > 1.3:
+            conf = 0.62 + min((20 - rsi7) / 80, 0.15) + min((vol_ratio - 1.3) / 5, 0.08)
+            return Signal(side="LONG", confidence=conf, tp_percent=0.005, sl_percent=0.004, leverage=12, reason=f"RSI(7)={rsi7:.1f} oversold snap | RSI(14)={rsi14:.1f} | Vol={vol_ratio:.1f}x")
+        if rsi7 > 80 and rsi14 > 65 and vol_ratio > 1.3:
+            conf = 0.62 + min((rsi7 - 80) / 80, 0.15) + min((vol_ratio - 1.3) / 5, 0.08)
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.005, sl_percent=0.004, leverage=12, reason=f"RSI(7)={rsi7:.1f} overbought snap | RSI(14)={rsi14:.1f} | Vol={vol_ratio:.1f}x")
+        return None
+
+class BBSqueezeStrategy(BaseStrategy):
+    id = "bb_squeeze"; name = "Bollinger Squeeze Breakout"; timeframe = "1m"; leverage = 10; avg_signals_per_hour = 0.8
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 30: return None
+        closes = [c.close for c in candles]; price = closes[-1]
+        bb = bollinger_bands(closes, 20, 2); bb_prev = bollinger_bands(closes[:-1], 20, 2)
+        if bb is None or bb_prev is None: return None
+        atr_val = atr(candles, 14); atr_pct = atr_val / price if price else 0
+        was_tight = bb_prev["bandwidth"] < 0.025; is_expanding = bb["bandwidth"] > bb_prev["bandwidth"] * 1.08
+        if not was_tight and bb["bandwidth"] >= 0.025: return None
+        if (was_tight and is_expanding) or bb["bandwidth"] < 0.02:
+            bonus = 0.08 if (was_tight and is_expanding) else 0
+            if price > bb["upper"]:
+                return Signal(side="LONG", confidence=0.58 + bonus, tp_percent=0.008, sl_percent=0.004, leverage=10, reason=f"BB squeeze breakout UP | BW={bb['bandwidth'] * 100:.2f}% | ATR={atr_pct * 100:.3f}%")
+            if price < bb["lower"]:
+                return Signal(side="SHORT", confidence=0.58 + bonus, tp_percent=0.008, sl_percent=0.004, leverage=10, reason=f"BB squeeze breakout DOWN | BW={bb['bandwidth'] * 100:.2f}% | ATR={atr_pct * 100:.3f}%")
+        return None
+
+class MACDFlipStrategy(BaseStrategy):
+    id = "macd_flip"; name = "MACD Histogram Flip"; timeframe = "1m"; leverage = 10; avg_signals_per_hour = 0.9
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 40: return None
+        closes = [c.close for c in candles]; price = closes[-1]
+        m = macd(closes); m_prev = macd(closes[:-1]); ema20 = ema(closes, 20)
+        if ema20 is None: return None
+        threshold = price * 0.0001
+        if m_prev["histogram"] < 0 and m["histogram"] > threshold:
+            trend_bonus = 0.06 if price > ema20 else 0
+            conf = 0.57 + trend_bonus + min(abs(m["histogram"]) / (price * 0.001), 0.1)
+            trend = "UP" if price > ema20 else "DOWN"
+            return Signal(side="LONG", confidence=conf, tp_percent=0.006, sl_percent=0.004, leverage=10, reason=f"MACD histogram flipped bullish | H={m['histogram']:.4f} | Trend={trend}")
+        if m_prev["histogram"] > 0 and m["histogram"] < -threshold:
+            trend_bonus = 0.06 if price < ema20 else 0
+            conf = 0.57 + trend_bonus + min(abs(m["histogram"]) / (price * 0.001), 0.1)
+            trend = "DOWN" if price < ema20 else "UP"
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.006, sl_percent=0.004, leverage=10, reason=f"MACD histogram flipped bearish | H={m['histogram']:.4f} | Trend={trend}")
+        return None
+
+class VWAPBounceStrategy(BaseStrategy):
+    id = "vwap_bounce"; name = "VWAP Bounce Scalp"; timeframe = "1m"; leverage = 12; avg_signals_per_hour = 1.0
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 40: return None
+        closes = [c.close for c in candles]; price = closes[-1]
+        vwap_val = vwap(candles, 30)
+        if vwap_val is None: return None
+        dist = (price - vwap_val) / vwap_val; rsi_val = rsi(closes, 14); prev = candles[-2]
+        if abs(dist) < 0.003 and prev.low <= vwap_val * 1.001 and price > vwap_val and 42 < rsi_val < 65:
+            conf = 0.60 + min((65 - rsi_val) / 200, 0.08)
+            return Signal(side="LONG", confidence=conf, tp_percent=0.005, sl_percent=0.003, leverage=12, reason=f"VWAP bounce long | Dist={dist * 100:.3f}% | RSI={rsi_val:.1f}")
+        if abs(dist) < 0.003 and prev.high >= vwap_val * 0.999 and price < vwap_val and 35 < rsi_val < 58:
+            conf = 0.60 + min((rsi_val - 35) / 200, 0.08)
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.005, sl_percent=0.003, leverage=12, reason=f"VWAP rejection short | Dist={dist * 100:.3f}% | RSI={rsi_val:.1f}")
+        return None
+
+class StochCrossStrategy(BaseStrategy):
+    id = "stoch_cross"; name = "Stochastic Zone Crossover"; timeframe = "1m"; leverage = 10; avg_signals_per_hour = 0.8
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 20: return None
+        closes = [c.close for c in candles]; stoch_now = stochastic(candles, 14); stoch_prev = stochastic(candles[:-1], 14); rsi_val = rsi(closes, 14)
+        if stoch_now["k"] < 25 and stoch_prev["k"] < stoch_prev["d"] and stoch_now["k"] > stoch_now["d"] and rsi_val < 40:
+            conf = 0.59 + min((25 - stoch_now["k"]) / 100, 0.1)
+            return Signal(side="LONG", confidence=conf, tp_percent=0.006, sl_percent=0.004, leverage=10, reason=f"Stoch bullish cross in OS | K={stoch_now['k']:.1f} D={stoch_now['d']:.1f} | RSI={rsi_val:.1f}")
+        if stoch_now["k"] > 75 and stoch_prev["k"] > stoch_prev["d"] and stoch_now["k"] < stoch_now["d"] and rsi_val > 60:
+            conf = 0.59 + min((stoch_now["k"] - 75) / 100, 0.1)
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.006, sl_percent=0.004, leverage=10, reason=f"Stoch bearish cross in OB | K={stoch_now['k']:.1f} D={stoch_now['d']:.1f} | RSI={rsi_val:.1f}")
+        return None
+
+class ATRBreakoutStrategy(BaseStrategy):
+    id = "atr_breakout"; name = "ATR Volatility Breakout"; timeframe = "1m"; leverage = 8; avg_signals_per_hour = 0.6
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 30: return None
+        closes = [c.close for c in candles]; price = closes[-1]
+        atr_val = atr(candles, 14)
+        if atr_val == 0: return None
+        prev = candles[-2]; ema20 = ema(closes, 20)
+        if ema20 is None: return None
+        vol_ratio = volume_spike(candles, 15)
+        if price > prev.high + atr_val * 0.5 and price > ema20 and vol_ratio > 1.0:
+            conf = 0.55 + (0.08 if vol_ratio > 1.5 else 0) + (0.04 if price > ema20 else 0)
+            return Signal(side="LONG", confidence=conf, tp_percent=0.010, sl_percent=0.005, leverage=8, reason=f"ATR breakout UP | Break={((price - prev.high) / atr_val):.2f}x ATR | Vol={vol_ratio:.1f}x")
+        if price < prev.low - atr_val * 0.5 and price < ema20 and vol_ratio > 1.0:
+            conf = 0.55 + (0.08 if vol_ratio > 1.5 else 0) + (0.04 if price < ema20 else 0)
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.010, sl_percent=0.005, leverage=8, reason=f"ATR breakout DOWN | Break={((prev.low - price) / atr_val):.2f}x ATR | Vol={vol_ratio:.1f}x")
+        return None
+
+class TripleEMAStrategy(BaseStrategy):
+    id = "triple_ema"; name = "Triple EMA Ribbon Entry"; timeframe = "1m"; leverage = 12; avg_signals_per_hour = 0.8
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 30: return None
+        closes = [c.close for c in candles]; ema5 = ema(closes, 5); ema13 = ema(closes, 13); ema21 = ema(closes, 21)
+        if any(v is None for v in [ema5, ema13, ema21]): return None
+        p_ema5 = ema(closes[:-1], 5); p_ema13 = ema(closes[:-1], 13)
+        if p_ema5 is None or p_ema13 is None: return None
+        rsi_val = rsi(closes, 14)
+        bullish_now = ema5 > ema13 and ema13 > ema21; wasnt_bullish = p_ema5 <= p_ema13
+        if bullish_now and wasnt_bullish and 45 < rsi_val < 72:
+            conf = 0.61 + min((72 - rsi_val) / 200, 0.08)
+            return Signal(side="LONG", confidence=conf, tp_percent=0.006, sl_percent=0.004, leverage=12, reason=f"Triple EMA aligned bullish | 5>{ema5:.2f} 13>{ema13:.2f} 21>{ema21:.2f}")
+        bearish_now = ema5 < ema13 and ema13 < ema21; wasnt_bearish = p_ema5 >= p_ema13
+        if bearish_now and wasnt_bearish and 28 < rsi_val < 55:
+            conf = 0.61 + min((rsi_val - 28) / 200, 0.08)
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.006, sl_percent=0.004, leverage=12, reason=f"Triple EMA aligned bearish | 5<{ema5:.2f} 13<{ema13:.2f} 21<{ema21:.2f}")
+        return None
+
+class EngulfingSRStrategy(BaseStrategy):
+    id = "engulfing_sr"; name = "Engulfing at Support/Resistance"; timeframe = "1m"; leverage = 10; avg_signals_per_hour = 0.6
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 40: return None
+        last = candles[-1]; prev = candles[-2]
+        bullish = (prev.close < prev.open and last.close > last.open and last.open <= prev.close and last.close >= prev.open)
+        bearish = (prev.close > prev.open and last.close < last.open and last.open >= prev.close and last.close <= prev.open)
+        if not bullish and not bearish: return None
+        recent = candles[-40:]
+        sorted_lows = sorted(c.low for c in recent); sorted_highs = sorted((c.high for c in recent), reverse=True)
+        support = sorted_lows[3]; resistance = sorted_highs[3]
+        near_support = abs(last.low - support) / support < 0.004 if support else False
+        near_resistance = abs(last.high - resistance) / resistance < 0.004 if resistance else False
+        if bullish and near_support:
+            return Signal(side="LONG", confidence=0.63, tp_percent=0.006, sl_percent=0.003, leverage=10, reason=f"Bullish engulfing at support {support:.2f}")
+        if bearish and near_resistance:
+            return Signal(side="SHORT", confidence=0.63, tp_percent=0.006, sl_percent=0.003, leverage=10, reason=f"Bearish engulfing at resistance {resistance:.2f}")
+        return None
+
+class OBVDivergenceStrategy(BaseStrategy):
+    id = "obv_divergence"; name = "OBV Divergence Reversal"; timeframe = "1m"; leverage = 8; avg_signals_per_hour = 0.5
+    def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
+        if len(candles) < 40: return None
+        closes = [c.close for c in candles]
+        recent_candles = candles[-10:]; prior_candles = candles[-20:-10]
+        recent_high = max(c.high for c in recent_candles); prior_high = max(c.high for c in prior_candles)
+        recent_low = min(c.low for c in recent_candles); prior_low = min(c.low for c in prior_candles)
+        obv_recent = obv(recent_candles); obv_prior = obv(prior_candles); rsi_val = rsi(closes, 14)
+        if recent_high > prior_high and obv_recent < obv_prior and rsi_val > 55:
+            conf = 0.56 + min((rsi_val - 55) / 200, 0.08)
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.007, sl_percent=0.004, leverage=8, reason=f"OBV bearish divergence | Price HH but OBV LH | RSI={rsi_val:.1f}")
+        if recent_low < prior_low and obv_recent > obv_prior and rsi_val < 45:
+            conf = 0.56 + min((45 - rsi_val) / 200, 0.08)
+            return Signal(side="LONG", confidence=conf, tp_percent=0.007, sl_percent=0.004, leverage=8, reason=f"OBV bullish divergence | Price LL but OBV HL | RSI={rsi_val:.1f}")
+        return None
+
+ALL_STRATEGIES = [
+    EMAScalpStrategy(), RSISnapStrategy(), BBSqueezeStrategy(), MACDFlipStrategy(), VWAPBounceStrategy(), StochCrossStrategy(), ATRBreakoutStrategy(), TripleEMAStrategy(), EngulfingSRStrategy(), OBVDivergenceStrategy()
+]
+
+class CorrelationFilter:
+    def __init__(self):
+        self.pair_cooldowns: dict[str, float] = {}
+        self.peak_balance: float = 0.0
+        self.recent_signal_log: list[dict] = []
+    def reset(self):
+        self.pair_cooldowns.clear(); self.peak_balance = 0.0; self.recent_signal_log.clear()
+    @staticmethod
+    def get_strategy_category(strategy_id: str) -> str:
+        for category, ids in CONFIG["strategy_categories"].items():
+            if strategy_id in ids: return category
+        return "unknown"
+    def get_state(self) -> dict:
+        now = time.time(); cooldown_sec = CONFIG["correlation"]["cooldown_sec"]; window_sec = CONFIG["correlation"]["same_side_window_sec"]
+        return {
+            "active_cooldowns": [{"pair": pair, "expires_in": cooldown_sec - (now - ts)} for pair, ts in self.pair_cooldowns.items() if now - ts < cooldown_sec],
+            "recent_signal_count": sum(1 for s in self.recent_signal_log if now - s["timestamp"] < window_sec),
+            "peak_balance": self.peak_balance,
+        }
+    @staticmethod
+    def detect_btc_macro_move(market_data: dict[str, list[Candle]]) -> BTCMacroStatus:
+        btc_candles = market_data.get("BTCUSDT"); lookback = CONFIG["correlation"]["btc_move_lookback"]
+        if not btc_candles or len(btc_candles) < lookback + 1:
+            return BTCMacroStatus(is_macro_move=False, direction=None, magnitude=0.0)
+        recent = btc_candles[-lookback:]; price_now = recent[-1].close; price_then = recent[0].open
+        move = (price_now - price_then) / price_then if price_then else 0
+        return BTCMacroStatus(is_macro_move=abs(move) >= CONFIG["correlation"]["btc_move_threshold"], direction="LONG" if move > 0 else "SHORT", magnitude=abs(move), btc_price=price_now)
+    def apply_same_side_flood_filter(self, signals: list[TradeSignal]) -> list[TradeSignal]:
+        now = time.time(); window = CONFIG["correlation"]["same_side_window_sec"]; max_same = CONFIG["correlation"]["max_same_side_signals"]
+        self.recent_signal_log = [s for s in self.recent_signal_log if now - s["timestamp"] < window]
+        side_counts = {"LONG": 0, "SHORT": 0}
+        for s in self.recent_signal_log:
+            side_counts[s["side"]] = side_counts.get(s["side"], 0) + 1
+        passed = []
+        for sig in signals:
+            if side_counts.get(sig.side, 0) >= max_same:
+                sig._filtered = True; sig._filter_reason = f"Same-side flood: {side_counts[sig.side]} {sig.side}s already in window"; continue
+            side_counts[sig.side] = side_counts.get(sig.side, 0) + 1; passed.append(sig)
+        return passed
+    def apply_category_filter(self, signals: list[TradeSignal], active_trades: list[ActiveTrade]) -> list[TradeSignal]:
+        max_per_cat = CONFIG["correlation"]["max_per_category"]
+        active_cat_counts: dict[str, int] = {}
+        for trade in active_trades:
+            cat = self.get_strategy_category(trade.strategy_id); active_cat_counts[cat] = active_cat_counts.get(cat, 0) + 1
+        pending_cat_counts: dict[str, int] = {}; passed = []
+        for sig in signals:
+            cat = sig.strategy_category; total = active_cat_counts.get(cat, 0) + pending_cat_counts.get(cat, 0)
+            if total >= max_per_cat:
+                sig._filtered = True; sig._filter_reason = f"Category cap: {cat} has {total}/{max_per_cat} slots"; continue
+            pending_cat_counts[cat] = pending_cat_counts.get(cat, 0) + 1; passed.append(sig)
+        return passed
+    def apply_cooldown_filter(self, signals: list[TradeSignal]) -> list[TradeSignal]:
+        now = time.time(); cooldown = CONFIG["correlation"]["cooldown_sec"]; passed = []
+        for sig in signals:
+            last = self.pair_cooldowns.get(sig.pair)
+            if last and now - last < cooldown:
+                sig._filtered = True; sig._filter_reason = f"Cooldown: {sig.pair} signaled {now - last:.0f}s ago"; continue
+            passed.append(sig)
+        return passed
+    def check_drawdown_breaker(self, balance: float) -> DrawdownStatus:
+        if balance > self.peak_balance: self.peak_balance = balance
+        peak = self.peak_balance
+        if peak == 0: return DrawdownStatus(paused=False, drawdown=0.0)
+        drawdown = (peak - balance) / peak; threshold = CONFIG["correlation"]["max_drawdown_pause"]
+        paused = drawdown >= threshold
+        return DrawdownStatus(paused=paused, drawdown=drawdown, peak=peak, threshold=threshold, message=(f"CIRCUIT BREAKER: {drawdown * 100:.2f}% drawdown from peak ${peak:.2f}. New entries paused." if paused else None))
+    def record_signals(self, signals: list[TradeSignal]):
+        now = time.time()
+        for sig in signals:
+            self.pair_cooldowns[sig.pair] = now
+            self.recent_signal_log.append({"side": sig.side, "timestamp": now})
+    def set_pair_cooldown(self, pair: str, ts: float | None = None):
+        self.pair_cooldowns[pair] = ts or time.time()
+
+correlation_filter = CorrelationFilter()
+
+def set_pair_cooldown(pair: str, ts: float | None = None):
+    correlation_filter.set_pair_cooldown(pair, ts)
+
+def run_signal_scan(market_data: dict[str, list[Candle]], active_trades: list[ActiveTrade], balance: float, funding: dict[str, float] | None = None, strategies: list[BaseStrategy] | None = None) -> ScanResult:
+    if strategies is None: strategies = ALL_STRATEGIES
+    result = ScanResult(); cfg = CONFIG
+    drawdown_check = correlation_filter.check_drawdown_breaker(balance); result.drawdown = drawdown_check
+    if drawdown_check.paused:
+        result.diagnostics = ScanDiagnostics(raw_count=0, final=0, reason="CIRCUIT_BREAKER"); return result
+    btc_macro = CorrelationFilter.detect_btc_macro_move(market_data); result.btc_macro = btc_macro
+    open_pairs = {t.pair for t in active_trades}
+    slots_available = cfg["max_concurrent_trades"] - len(active_trades)
+    if slots_available <= 0:
+        result.diagnostics = ScanDiagnostics(raw_count=0, final=0, reason="ALL_SLOTS_FULL"); return result
+    raw_signals: list[TradeSignal] = []
+    conf_th = cfg.get("confidence_threshold", 0.55)
+    confirm = cfg.get("confirm_signal", False)
+    min_vol = cfg.get("min_volatility_pct", 0.0)
+    ema_fast_n = cfg.get("trend_ema_fast", 0)
+    ema_slow_n = cfg.get("trend_ema_slow", 0)
+    regime_min_trend = cfg.get("regime_min_trend_pct", 0.0)
+    atr_period = cfg.get("atr_period", 14)
+    vol_target = cfg.get("vol_target_pct", 0.0)
+    max_funding_long = cfg.get("max_funding_long", 0.0)
+    max_funding_short = cfg.get("max_funding_short", 0.0)
+    for pair in cfg["pairs"]:
+        candles = market_data.get(pair)
+        if not candles or len(candles) < 50: continue
+        if pair in open_pairs: continue
+        if btc_macro.is_macro_move and pair != "BTCUSDT": continue
+        price = candles[-1].close
+        # Volatility filter
+        if min_vol and len(candles) >= 20:
+            hi = max(c.high for c in candles[-20:])
+            lo = min(c.low for c in candles[-20:])
+            vol_pct = (hi - lo) / price if price else 0
+            if vol_pct < min_vol:
+                continue
+        # Trend filter (EMA)
+        closes = [c.close for c in candles]
+        ema_fast = ema(closes, ema_fast_n) if ema_fast_n else None
+        ema_slow = ema(closes, ema_slow_n) if ema_slow_n else None
+        # Regime filter: if trend strength small, only allow reversion/structural
+        trend_strength = 0.0
+        if ema_fast is not None and ema_slow is not None and price:
+            trend_strength = abs(ema_fast - ema_slow) / price
+        for strategy in strategies:
+            if btc_macro.is_macro_move and pair == "BTCUSDT":
+                cat = CorrelationFilter.get_strategy_category(strategy.id)
+                if cat != "reversion": continue
+            eval_result = strategy.evaluate(candles)
+            if eval_result is None: continue
+            if eval_result.confidence < conf_th: continue
+            if confirm:
+                prev_eval = strategy.evaluate(candles[:-1]) if len(candles) > 51 else None
+                if not prev_eval or prev_eval.side != eval_result.side or prev_eval.confidence < conf_th:
+                    continue
+            # Regime filter
+            if regime_min_trend and trend_strength < regime_min_trend:
+                if strategy.id in CONFIG["strategy_categories"]["trend"]:
+                    continue
+            # Trend alignment
+            if ema_fast is not None and ema_slow is not None:
+                if eval_result.side == "LONG" and not (price > ema_fast and ema_fast > ema_slow):
+                    continue
+                if eval_result.side == "SHORT" and not (price < ema_fast and ema_fast < ema_slow):
+                    continue
+            # Funding filter
+            if funding:
+                fr = funding.get(pair, 0.0)
+                if eval_result.side == "LONG" and max_funding_long and fr > max_funding_long:
+                    continue
+                if eval_result.side == "SHORT" and max_funding_short and fr < -max_funding_short:
+                    continue
+            # Volatility-targeted sizing (ATR)
+            atr_val = atr(candles, atr_period) if atr_period else 0.0
+            atr_pct = (atr_val / price) if price else 0.0
+            base_size = max(cfg["min_trade_size"], min(balance * cfg["risk_per_trade"], balance / cfg["max_concurrent_trades"]))
+            if vol_target and atr_pct > 0:
+                scale = vol_target / atr_pct
+                trade_size = max(cfg["min_trade_size"], min(base_size * scale, base_size * 2))
+            else:
+                trade_size = base_size
+            if trade_size < cfg["min_trade_size"] or balance < trade_size: continue
+            tp_price = price * (1 + eval_result.tp_percent) if eval_result.side == "LONG" else price * (1 - eval_result.tp_percent)
+            sl_price = price * (1 - eval_result.sl_percent) if eval_result.side == "LONG" else price * (1 + eval_result.sl_percent)
+            economics = calculate_trade_economics(price, tp_price, sl_price, eval_result.side, trade_size, eval_result.leverage)
+            if not economics.is_profitable: continue
+            raw_signals.append(TradeSignal(pair=pair, strategy_id=strategy.id, strategy_name=strategy.name, strategy_category=CorrelationFilter.get_strategy_category(strategy.id), side=eval_result.side, confidence=eval_result.confidence, entry_price=price, tp_price=tp_price, sl_price=sl_price, leverage=eval_result.leverage, trade_size=trade_size, reason=eval_result.reason, economics=economics))
+    raw_signals.sort(key=lambda s: s.confidence, reverse=True)
+    seen_pairs: set[str] = set(); deduped: list[TradeSignal] = []
+    for sig in raw_signals:
+        if sig.pair in seen_pairs: continue
+        seen_pairs.add(sig.pair); deduped.append(sig)
+    diag = ScanDiagnostics(raw_count=len(deduped))
+    after_cooldown = correlation_filter.apply_cooldown_filter(deduped); diag.after_cooldown = len(after_cooldown)
+    after_flood = correlation_filter.apply_same_side_flood_filter(after_cooldown); diag.after_flood = len(after_flood)
+    after_category = correlation_filter.apply_category_filter(after_flood, active_trades); diag.after_category = len(after_category)
+    final_signals = after_category[:slots_available]; diag.final = len(final_signals)
+    correlation_filter.record_signals(final_signals)
+    all_filtered = [s for s in deduped + after_cooldown + after_flood + after_category if s._filtered]
+    result.signals = final_signals; result.filtered = all_filtered; result.diagnostics = diag
+    return result
+
+def get_correlation_state() -> dict:
+    return correlation_filter.get_state()
+
+def reset_correlation_state():
+    correlation_filter.reset()
+
+if __name__ == "__main__":
+    print("Multi-Strategy Crypto Futures Engine loaded.")
+    print(f"Strategies: {len(ALL_STRATEGIES)}"); print(f"Pairs: {len(CONFIG['pairs'])}"); print(f"Target: ~8.7 signals/hour"); print(f"Max concurrent: {CONFIG['max_concurrent_trades']}"); print(f"Min trade: ${CONFIG['min_trade_size']}")
+    for s in ALL_STRATEGIES:
+        print(f" {s.id:<20} {s.name:<35} ~{s.avg_signals_per_hour}/hr Lev {s.leverage}x")
