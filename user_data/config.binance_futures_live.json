@@ -1,0 +1,83 @@
+{
+  "max_open_trades": 8,
+  "stake_currency": "USDT",
+  "stake_amount": 15,
+  "timeframe": "5m",
+  "dry_run": false,
+  "cancel_open_orders_on_exit": true,
+  "unfilledtimeout": {
+    "entry": 10,
+    "exit": 10,
+    "exit_timeout_count": 0,
+    "unit": "minutes"
+  },
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "ccxt_config": {
+      "enableRateLimit": true,
+      "options": {
+        "defaultType": "future"
+      }
+    },
+    "ccxt_async_config": {
+      "enableRateLimit": true,
+      "options": {
+        "defaultType": "future"
+      }
+    },
+    "pair_whitelist": [
+      "ETH/USDT",
+      "BNB/USDT",
+      "SOL/USDT",
+      "XRP/USDT",
+      "ADA/USDT",
+      "LINK/USDT",
+      "LTC/USDT"
+    ],
+    "pair_blacklist": [
+      ".*UP/USDT",
+      ".*DOWN/USDT",
+      ".*BEAR/USDT",
+      ".*BULL/USDT"
+    ]
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "edge": {
+    "enabled": false
+  },
+  "logger": {
+    "level": "info"
+  },
+  "strategy": "RangeReenter5m",
+  "exit_pricing": {
+    "price_side": "other",
+    "use_order_book": false
+  },
+  "entry_pricing": {
+    "price_side": "other",
+    "use_order_book": false
+  },
+  "order_types": {
+    "entry": "market",
+    "exit": "market",
+    "stoploss": "market",
+    "stoploss_on_exchange": false
+  },
+  "order_time_in_force": {
+    "entry": "GTC",
+    "exit": "GTC"
+  },
+  "initial_state": "running",
+  "futures_leverage": 4,
+  "futures_position_mode": "oneway",
+  "futures_leverage_mode": "cross",
+  "websocket": {
+    "enabled": false
+  }
+}
