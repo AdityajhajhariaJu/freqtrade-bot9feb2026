@@ -41,6 +41,7 @@ MAX_AGE = {
 
 # In-memory tracker: pair -> {strategy_id, opened_at}
 position_meta = {}
+_LAST_SWAP_TS = 0
 
 
 
@@ -158,7 +159,7 @@ async def place_orders(exchange, signal):
         await exchange.create_order(signal.pair, 'stop_market', 'sell' if signal.side == 'LONG' else 'buy', amount, None, {**reduce_params, "stopPrice": signal.sl_price})
     except Exception as e:
         print(f"SL error {signal.pair}: {e}")
-    position_meta[signal.pair] = {"strategy_id": signal.strategy_id, "opened_at": time.time()}
+    position_meta[signal.pair] = {"strategy_id": signal.strategy_id, "opened_at": time.time(), "confidence": signal.confidence}
     log_event("ENTRY", signal.pair, signal.side, qty=amount, price=signal.entry_price, strategy_id=signal.strategy_id, strategy_name=signal.strategy_name, note=signal.reason)
     print(f"EXECUTED {signal.pair} {signal.side} size=${signal.trade_size:.2f} lev={signal.leverage} entry~{signal.entry_price} tp={signal.tp_price} sl={signal.sl_price} strat={signal.strategy_name} reason={signal.reason}")
 
@@ -173,6 +174,21 @@ async def close_position(exchange, pair, side, amount):
         print(f"Close error {pair}: {e}")
 
 
+
+
+def should_momentum_exit(candles, side):
+    if len(candles) < 15: return False
+    closes = [c.close for c in candles]
+    r = rsi(closes, 14)
+    last3 = candles[-3:]
+    vols = [c.volume for c in last3]
+    vol_down = vols[0] > vols[1] > vols[2]
+    if side == "LONG":
+        green = all(c.close > c.open for c in last3)
+        return r >= 75 and green and vol_down
+    else:
+        red = all(c.close < c.open for c in last3)
+        return r <= 25 and red and vol_down
 def position_age_seconds(pair, p_obj):
     meta = position_meta.get(pair)
     strat_id = meta.get('strategy_id') if meta else None
@@ -247,6 +263,35 @@ async def loop():
             if res.drawdown and res.drawdown.paused:
                 print(res.drawdown.message or "Drawdown breaker active; skipping")
             else:
+                # opportunity cost swap (fee-aware)
+                global _LAST_SWAP_TS
+                if res.signals:
+                    slots_available = STRAT_CONFIG["max_concurrent_trades"] - len(active_trades)
+                    if slots_available <= 0 and time.time() - _LAST_SWAP_TS > 3600:
+                        best = max(res.signals, key=lambda s: s.confidence)
+                        try:
+                            positions = await exchange.fetch_positions()
+                            candidates = []
+                            for p in positions:
+                                amt = float(p.get('contracts') or p.get('contractSize') or 0)
+                                if amt == 0: continue
+                                pair = p.get('symbol') or p.get('info', {}).get('symbol') or p.get('id')
+                                side_field = p.get('side') or p.get('info', {}).get('positionSide') or ''
+                                side = 'LONG' if str(side_field).lower() == 'long' else 'SHORT'
+                                pnl = float(p.get('unrealizedPnl') or 0)
+                                meta = position_meta.get(pair, {})
+                                conf = float(meta.get('confidence') or 0)
+                                if pnl <= 0:
+                                    candidates.append((conf, pnl, pair, side, amt))
+                            if candidates:
+                                weakest = min(candidates, key=lambda x: x[0])
+                                if best.confidence >= weakest[0] + 0.10:
+                                    _, _, pair, side, amt = weakest
+                                    await close_position(exchange, pair, side, amt)
+                                    position_meta.pop(pair, None)
+                                    _LAST_SWAP_TS = time.time()
+                        except Exception as e:
+                            print(f"Swap check error: {e}")
                 for sig in res.signals:
                     await ensure_leverage(exchange, sig.pair, sig.leverage)
                     await place_orders(exchange, sig)

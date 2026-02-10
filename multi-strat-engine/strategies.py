@@ -112,6 +112,18 @@ CONFIG = {
     "vol_target_pct": 0.004,
     "tp_multiplier": 1.15,
     "min_tp_percent": 0.0012,
+    "divergence_boost": {"enabled": True, "pairs_min": 3, "boost": 0.04, "lookback": 20},
+    "oi_boost": {"enabled": True, "boost": 0.06},
+    "adaptive_params": {
+        "enabled": True,
+        "update_sec": 1800,
+        "regime_atr_pct": {"low": 0.0015, "high": 0.0045},
+        "rsi_period": {"low": 18, "mid": 14, "high": 12},
+        "rsi_oversold": {"low": 32, "mid": 30, "high": 28},
+        "rsi_overbought": {"low": 68, "mid": 70, "high": 72},
+        "ema_fast": {"low": 30, "mid": 20, "high": 15},
+        "ema_slow": {"low": 80, "mid": 50, "high": 35}
+    },
     "max_funding_long": 0.0005,
     "max_funding_short": 0.0005,
     "fees": {"maker_rate": 0.0002, "taker_rate": 0.0005},
@@ -229,6 +241,68 @@ def atr(candles: list[Candle], period: int = 14) -> float:
         total += tr
     return total / period
 
+# Adaptive parameter cache (per pair)
+_ADAPT_CACHE = {}
+_OI_CACHE = {}
+
+def get_adaptive_params(pair: str, candles: list[Candle]):
+    cfg = CONFIG.get("adaptive_params", {})
+    if not cfg.get("enabled", False):
+        return None
+    now = time.time()
+    cache = _ADAPT_CACHE.get(pair)
+    if cache and (now - cache.get("ts", 0) < cfg.get("update_sec", 7200)):
+        return cache.get("params")
+    price = candles[-1].close if candles else 0
+    atr_val = atr(candles, cfg.get("atr_period", 14)) if candles else 0
+    atr_pct = (atr_val / price) if price else 0
+    low = cfg.get("regime_atr_pct", {}).get("low", 0.0015)
+    high = cfg.get("regime_atr_pct", {}).get("high", 0.0045)
+    if atr_pct < low:
+        regime = "low"
+    elif atr_pct > high:
+        regime = "high"
+    else:
+        regime = "mid"
+    params = {
+        "rsi_period": cfg.get("rsi_period", {}).get(regime, 14),
+        "rsi_oversold": cfg.get("rsi_oversold", {}).get(regime, 30),
+        "rsi_overbought": cfg.get("rsi_overbought", {}).get(regime, 70),
+        "ema_fast": cfg.get("ema_fast", {}).get(regime, 20),
+        "ema_slow": cfg.get("ema_slow", {}).get(regime, 50),
+    }
+    _ADAPT_CACHE[pair] = {"ts": now, "params": params}
+    return params
+
+
+def compute_market_divergence(market_data: dict[str, list[Candle]], lookback: int = 20):
+    bull = 0; bear = 0
+    for pair, candles in market_data.items():
+        if len(candles) < lookback + 2: continue
+        closes = [c.close for c in candles]
+        recent = closes[-lookback:]
+        p_low = min(recent); p_prev = min(recent[:-5]) if len(recent) > 5 else min(recent)
+        r_recent = rsi(closes[-(lookback+1):], 14)
+        r_prev = rsi(closes[-(lookback*2):-(lookback)], 14) if len(closes) > lookback*2 else r_recent
+        if p_low < p_prev and r_recent > r_prev: bull += 1
+        if p_low > p_prev and r_recent < r_prev: bear += 1
+    if bull > bear: return 1, bull
+    if bear > bull: return -1, bear
+    return 0, max(bull, bear)
+
+
+def compute_oi_context(pair: str, price: float, oi: float):
+    if oi is None or oi == 0: return 0
+    prev = _OI_CACHE.get(pair)
+    _OI_CACHE[pair] = {"price": price, "oi": oi}
+    if not prev: return 0
+    dp = price - prev["price"]
+    doi = oi - prev["oi"]
+    if dp > 0 and doi > 0: return 1  # trend confirm long
+    if dp < 0 and doi < 0: return 2  # liquidation fade long
+    return 0
+
+
 def stochastic(candles: list[Candle], k_period: int = 14) -> dict:
     if len(candles) < k_period:
         return {"k": 50.0, "d": 50.0}
@@ -310,13 +384,17 @@ class RSISnapStrategy(BaseStrategy):
     def evaluate(self, candles: list[Candle]) -> Optional[Signal]:
         if len(candles) < 30: return None
         closes = [c.close for c in candles]
-        rsi7 = rsi(closes, 7); rsi14 = rsi(closes, 14); vol_ratio = volume_spike(candles, 20)
-        if rsi7 < 20 and rsi14 < 35 and vol_ratio > 1.3:
-            conf = 0.62 + min((20 - rsi7) / 80, 0.15) + min((vol_ratio - 1.3) / 5, 0.08)
-            return Signal(side="LONG", confidence=conf, tp_percent=0.005, sl_percent=0.004, leverage=12, reason=f"RSI(7)={rsi7:.1f} oversold snap | RSI(14)={rsi14:.1f} | Vol={vol_ratio:.1f}x")
-        if rsi7 > 80 and rsi14 > 65 and vol_ratio > 1.3:
-            conf = 0.62 + min((rsi7 - 80) / 80, 0.15) + min((vol_ratio - 1.3) / 5, 0.08)
-            return Signal(side="SHORT", confidence=conf, tp_percent=0.005, sl_percent=0.004, leverage=12, reason=f"RSI(7)={rsi7:.1f} overbought snap | RSI(14)={rsi14:.1f} | Vol={vol_ratio:.1f}x")
+        params = get_adaptive_params("RSI_SNAP", candles) or {}
+        rsi_p = int(params.get("rsi_period", 14))
+        rsi_os = float(params.get("rsi_oversold", 30))
+        rsi_ob = float(params.get("rsi_overbought", 70))
+        rsi7 = rsi(closes, 7); rsiP = rsi(closes, rsi_p); vol_ratio = volume_spike(candles, 20)
+        if rsi7 < (rsi_os - 10) and rsiP < rsi_os and vol_ratio > 1.3:
+            conf = 0.62 + min((rsi_os - rsi7) / 80, 0.15) + min((vol_ratio - 1.3) / 5, 0.08)
+            return Signal(side="LONG", confidence=conf, tp_percent=0.005, sl_percent=0.004, leverage=12, reason=f"RSI(7)={rsi7:.1f} oversold snap | RSI({rsi_p})={rsiP:.1f} | Vol={vol_ratio:.1f}x")
+        if rsi7 > (rsi_ob + 10) and rsiP > rsi_ob and vol_ratio > 1.3:
+            conf = 0.62 + min((rsi7 - rsi_ob) / 80, 0.15) + min((vol_ratio - 1.3) / 5, 0.08)
+            return Signal(side="SHORT", confidence=conf, tp_percent=0.005, sl_percent=0.004, leverage=12, reason=f"RSI(7)={rsi7:.1f} overbought snap | RSI({rsi_p})={rsiP:.1f} | Vol={vol_ratio:.1f}x")
         return None
 
 class BBSqueezeStrategy(BaseStrategy):
@@ -542,9 +620,14 @@ correlation_filter = CorrelationFilter()
 def set_pair_cooldown(pair: str, ts: float | None = None):
     correlation_filter.set_pair_cooldown(pair, ts)
 
-def run_signal_scan(market_data: dict[str, list[Candle]], active_trades: list[ActiveTrade], balance: float, funding: dict[str, float] | None = None, strategies: list[BaseStrategy] | None = None) -> ScanResult:
+def run_signal_scan(market_data: dict[str, list[Candle]], active_trades: list[ActiveTrade], balance: float, funding: dict[str, float] | None = None, open_interest: dict[str, float] | None = None, spread_map: dict[str, tuple[float,float]] | None = None, strategies: list[BaseStrategy] | None = None) -> ScanResult:
     if strategies is None: strategies = ALL_STRATEGIES
     result = ScanResult(); cfg = CONFIG
+    if open_interest is None:
+        open_interest = {}
+    if spread_map is None:
+        spread_map = {}
+
     drawdown_check = correlation_filter.check_drawdown_breaker(balance); result.drawdown = drawdown_check
     if drawdown_check.paused:
         result.diagnostics = ScanDiagnostics(raw_count=0, final=0, reason="CIRCUIT_BREAKER"); return result
@@ -579,8 +662,11 @@ def run_signal_scan(market_data: dict[str, list[Candle]], active_trades: list[Ac
                 continue
         # Trend filter (EMA)
         closes = [c.close for c in candles]
-        ema_fast = ema(closes, ema_fast_n) if ema_fast_n else None
-        ema_slow = ema(closes, ema_slow_n) if ema_slow_n else None
+        ap = get_adaptive_params(pair, candles) if cfg.get("adaptive_params", {}).get("enabled", False) else None
+        af = ap.get("ema_fast") if ap else ema_fast_n
+        aslow = ap.get("ema_slow") if ap else ema_slow_n
+        ema_fast = ema(closes, af) if af else None
+        ema_slow = ema(closes, aslow) if aslow else None
         # Regime filter: if trend strength small, only allow reversion/structural
         trend_strength = 0.0
         if ema_fast is not None and ema_slow is not None and price:
@@ -635,7 +721,27 @@ def run_signal_scan(market_data: dict[str, list[Candle]], active_trades: list[Ac
             economics = calculate_trade_economics(price, tp_price, sl_price, eval_result.side, trade_size, eval_result.leverage)
             if not economics.is_profitable: continue
             raw_signals.append(TradeSignal(pair=pair, strategy_id=strategy.id, strategy_name=strategy.name, strategy_category=CorrelationFilter.get_strategy_category(strategy.id), side=eval_result.side, confidence=eval_result.confidence, entry_price=price, tp_price=tp_price, sl_price=sl_price, leverage=eval_result.leverage, trade_size=trade_size, reason=eval_result.reason, economics=economics))
+    # apply market divergence boost (confidence only)
+    div_cfg = cfg.get("divergence_boost", {})
+    div_dir, div_count = (0,0)
+    if div_cfg.get("enabled", False):
+        div_dir, div_count = compute_market_divergence(market_data, div_cfg.get("lookback", 20))
+    if div_dir != 0 and div_count >= div_cfg.get("pairs_min", 3):
+        boost = div_cfg.get("boost", 0.04)
+        for s in raw_signals:
+            if (div_dir == 1 and s.side == "LONG") or (div_dir == -1 and s.side == "SHORT"):
+                s.confidence += boost
+    # apply OI context boost (confidence only)
+    oi_cfg = cfg.get("oi_boost", {})
+    if oi_cfg.get("enabled", False) and open_interest:
+        for s in raw_signals:
+            oi = open_interest.get(s.pair, 0.0)
+            ctx = compute_oi_context(s.pair, s.entry_price, oi)
+            if ctx in (1,2) and s.side == "LONG":
+                s.confidence += oi_cfg.get("boost", 0.06)
     raw_signals.sort(key=lambda s: s.confidence, reverse=True)
+
+
     seen_pairs: set[str] = set(); deduped: list[TradeSignal] = []
     for sig in raw_signals:
         if sig.pair in seen_pairs: continue
