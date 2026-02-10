@@ -9,9 +9,16 @@ A lightweight multi‑strategy crypto futures bot with strict risk filters, TP/S
 ## Features
 - 10 strategies (trend / reversion / structural)
 - 1m scanning with 200‑bar history
-- TP/SL reduce‑only orders
+- TP/SL reduce‑only orders (ATR‑scaled + min TP)
 - Cooldowns, correlation caps, drawdown circuit breaker
 - Funding/volatility/trend filters
+- **Adaptive parameters** (RSI Snap + EMA trend filter, slow updates)
+- **Divergence boost** (market‑wide RSI/price divergence)
+- **Open‑interest boost** (confidence only)
+- **Spread gate** (pauses pairs when spread spikes)
+- **BTC dump correlated exit** (close longs on 0.5% 1m BTC drop)
+- **Momentum exhaustion exit** (early exit on RSI+volume fade)
+- **Opportunity‑cost swap** (swap into stronger signal, 1/hr)
 - Post‑trade reporting (PnL, heatmap, slippage)
 - Systemd service for always‑on operation
 
@@ -96,18 +103,26 @@ Max‑age rules (current):
 - Reversion: **15 min**
 - Structural: **35 min**
 
+Extra exits:
+- **BTC dump exit:** close longs if BTC drops ≥0.5% in 1m
+- **Momentum exhaustion exit:** RSI extreme + 3 candles + volume fade
+
 ---
 
 ## Risk + Filters (current defaults)
 - `confidence_threshold`: 0.64
 - `confirm_signal`: true (2‑candle confirmation)
 - `min_volatility_pct`: 0.2%
-- `trend_ema_fast/slow`: 50 / 200
+- `trend_ema_fast/slow`: 50 / 200 (adaptive)
 - `regime_min_trend_pct`: 0.15%
 - `cooldown_sec`: 300
 - `post_close_cooldown_sec`: 600
 - `max_concurrent_trades`: 4
 - `max_drawdown_pause`: 30%
+- `signal_decay`: enabled (half‑life 8m)
+- `divergence_boost`: +0.04
+- `oi_boost`: +0.06
+- `spread_gate`: 2× 1‑hour avg
 
 ### Pair‑specific strategy limits
 - `LINKUSDT`: RSI Snap, Stoch Cross, OBV Divergence only
