@@ -5,7 +5,7 @@ from pathlib import Path
 
 CONFIG_PATH = "/opt/freqtrade/user_data/config.binance_futures_live.json"
 OUT_CSV = "/opt/multi-strat-engine/reports/slippage_fees.csv"
-PAIRS = ["ETH/USDT","BNB/USDT","SOL/USDT","LINK/USDT","LTC/USDT","DOGE/USDT"]
+PAIRS = ["ETH/USDT","SOL/USDT","LTC/USDT","DOGE/USDT","AVAX/USDT","NEAR/USDT","INJ/USDT","LINK/USDT","BNB/USDT"]
 
 def main(days=7):
     cfg = json.loads(Path(CONFIG_PATH).read_text())

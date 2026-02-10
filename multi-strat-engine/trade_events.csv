@@ -1,6 +1,2 @@
-1770655408,ENTRY,ETHUSDT,LONG,0.08131261797589619,2073.0,bb_squeeze,Bollinger Squeeze Breakout,,BB squeeze breakout UP | BW=1.07% | ATR=0.237%
-1770655468,ENTRY,BNBUSDT,LONG,0.31584100563776196,633.23,bb_squeeze,Bollinger Squeeze Breakout,,BB squeeze breakout UP | BW=0.81% | ATR=0.160%
-1770655528,ENTRY,LINKUSDT,LONG,16.531365313652977,8.816,atr_breakout,ATR Volatility Breakout,,ATR breakout UP | Break=1.45x ATR | Vol=3.4x
-1770656788,ENTRY,LINKUSDT,LONG,27.22940776038121,8.814,vwap_bounce,VWAP Bounce Scalp,,VWAP bounce long | Dist=0.071% | RSI=52.4
-1770658212,ENTRY,DOGEUSDT,LONG,2100.619682806428,0.09521,bb_squeeze,Bollinger Squeeze Breakout,,BB squeeze breakout UP | BW=0.43% | ATR=0.111%
-1770658573,ENTRY,ETHUSDT,LONG,0.065313739211569,2120.38,bb_squeeze,Bollinger Squeeze Breakout,,BB squeeze breakout UP | BW=2.30% | ATR=0.289%
+1770700531,ENTRY,SOLUSDT,LONG,2.7752081406105455,86.48,vwap_bounce,VWAP Bounce Scalp,,VWAP bounce long | Dist=0.055% | RSI=50.8
+1770700711,ENTRY,AVAXUSDT,SHORT,22.346368715083802,8.95,bb_squeeze,Bollinger Squeeze Breakout,,BB squeeze breakout DOWN | BW=0.33% | ATR=0.094%

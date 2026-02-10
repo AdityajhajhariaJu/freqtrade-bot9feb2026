@@ -17,23 +17,26 @@ import ccxt.async_support as ccxt
 from strategies import Candle, ActiveTrade, run_signal_scan, CONFIG as STRAT_CONFIG, set_pair_cooldown
 
 CONFIG_PATH = "/opt/freqtrade/user_data/config.binance_futures_live.json"
-PAIRS = ["ETHUSDT", "BNBUSDT", "SOLUSDT", "LINKUSDT", "LTCUSDT", "DOGEUSDT"]
+PAIRS = ["ETHUSDT", "SOLUSDT", "LTCUSDT", "DOGEUSDT", "AVAXUSDT", "NEARUSDT", "INJUSDT", "LINKUSDT", "BNBUSDT"]
 FETCH_LIMIT = 200
 TIMEFRAME = "1m"
 LOOP_SEC = 60
 DEFAULT_MAX_AGE = 25 * 60  # 25 minutes
 # Max ages (seconds) per strategy (upper bound minutes)
 MAX_AGE = {
-    "ema_scalp": 7 * 60,
-    "rsi_snap": 8 * 60,
-    "bb_squeeze": 20 * 60,
-    "macd_flip": 15 * 60,
-    "vwap_bounce": 10 * 60,
-    "stoch_cross": 8 * 60,
-    "atr_breakout": 25 * 60,
-    "triple_ema": 20 * 60,
-    "engulfing_sr": 30 * 60,
-    "obv_divergence": 30 * 60,
+    # Trend/Breakout -> 40m
+    "ema_scalp": 40 * 60,
+    "bb_squeeze": 40 * 60,
+    "macd_flip": 40 * 60,
+    "atr_breakout": 40 * 60,
+    "triple_ema": 40 * 60,
+    # Reversion -> 15m
+    "rsi_snap": 15 * 60,
+    "vwap_bounce": 15 * 60,
+    "stoch_cross": 15 * 60,
+    "obv_divergence": 15 * 60,
+    # Structural -> 35m
+    "engulfing_sr": 35 * 60,
 }
 
 # In-memory tracker: pair -> {strategy_id, opened_at}

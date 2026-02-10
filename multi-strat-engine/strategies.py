@@ -100,9 +100,9 @@ class ScanResult:
 
 CONFIG = {
     "min_trade_size": 10,
-    "max_concurrent_trades": 3,
+    "max_concurrent_trades": 4,
     "risk_per_trade": 0.02,
-    "confidence_threshold": 0.62,
+    "confidence_threshold": 0.64,
     "confirm_signal": True,
     "min_volatility_pct": 0.002,  # 0.2%
     "trend_ema_fast": 50,
@@ -110,6 +110,8 @@ CONFIG = {
     "regime_min_trend_pct": 0.0015,
     "atr_period": 14,
     "vol_target_pct": 0.004,
+    "tp_multiplier": 1.15,
+    "min_tp_percent": 0.0012,
     "max_funding_long": 0.0005,
     "max_funding_short": 0.0005,
     "fees": {"maker_rate": 0.0002, "taker_rate": 0.0005},
@@ -121,7 +123,11 @@ CONFIG = {
         "btc_move_threshold": 0.008,
         "cooldown_sec": 300,
         "post_close_cooldown_sec": 600,
-        "max_drawdown_pause": 0.05,
+        "max_drawdown_pause": 0.30,
+    },
+        "pair_filters": {
+        "LINKUSDT": ["rsi_snap", "stoch_cross", "obv_divergence"],
+        "BNBUSDT": ["rsi_snap", "vwap_bounce"],
     },
     "strategy_categories": {
         "trend": ["ema_scalp", "triple_ema", "macd_flip", "atr_breakout"],
@@ -129,7 +135,7 @@ CONFIG = {
         "structural": ["bb_squeeze", "vwap_bounce", "engulfing_sr"],
     },
     "pairs": [
-        "ETHUSDT", "BNBUSDT", "SOLUSDT", "LINKUSDT", "LTCUSDT", "DOGEUSDT",
+        "ETHUSDT", "SOLUSDT", "LTCUSDT", "DOGEUSDT", "AVAXUSDT", "NEARUSDT", "INJUSDT", "LINKUSDT", "BNBUSDT",
     ],
     "timeframes": ["1m", "5m"],
 }
@@ -585,6 +591,10 @@ def run_signal_scan(market_data: dict[str, list[Candle]], active_trades: list[Ac
                 if cat != "reversion": continue
             eval_result = strategy.evaluate(candles)
             if eval_result is None: continue
+            # pair-specific strategy allowlist
+            pf = cfg.get("pair_filters", {})
+            if pair in pf and strategy.id not in pf[pair]:
+                continue
             if eval_result.confidence < conf_th: continue
             if confirm:
                 prev_eval = strategy.evaluate(candles[:-1]) if len(candles) > 51 else None
@@ -617,7 +627,10 @@ def run_signal_scan(market_data: dict[str, list[Candle]], active_trades: list[Ac
             else:
                 trade_size = base_size
             if trade_size < cfg["min_trade_size"] or balance < trade_size: continue
-            tp_price = price * (1 + eval_result.tp_percent) if eval_result.side == "LONG" else price * (1 - eval_result.tp_percent)
+            tp_mult = cfg.get("tp_multiplier", 1.0)
+            min_tp = cfg.get("min_tp_percent", 0.0)
+            tp_pct = max(eval_result.tp_percent * tp_mult, min_tp)
+            tp_price = price * (1 + tp_pct) if eval_result.side == "LONG" else price * (1 - tp_pct)
             sl_price = price * (1 - eval_result.sl_percent) if eval_result.side == "LONG" else price * (1 + eval_result.sl_percent)
             economics = calculate_trade_economics(price, tp_price, sl_price, eval_result.side, trade_size, eval_result.leverage)
             if not economics.is_profitable: continue
