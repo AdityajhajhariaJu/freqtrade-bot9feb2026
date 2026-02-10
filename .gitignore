@@ -1,0 +1,7 @@
+# logs & reports
+multi-strat-engine/reports/*.csv
+multi-strat-engine/reports/.post_trade_state.json
+multi-strat-engine/reports/.restart_state.json
+multi-strat-engine/reports/*.log
+multi-strat-engine/trade_events.csv
+multi-strat-engine/*.log
